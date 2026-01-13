@@ -1,0 +1,14 @@
+[Unit]
+Description=docs2image - PDF/PPTX to PNG converter service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/tjrtm/docs2image
+ExecStart=/home/tjrtm/docs2image/venv/bin/uvicorn server:app --host 172.17.0.1 --port 8085
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
