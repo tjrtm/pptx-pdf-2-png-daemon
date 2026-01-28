@@ -200,6 +200,49 @@ http://172.17.0.1:8085/convert
 http://localhost:8085/convert
 ```
 
+### Serving Output via Docker Nginx (with Traefik)
+
+If you have an existing docker-compose setup with Traefik as reverse proxy, you can expose the output directory by adding this service to your `docker-compose.yml`:
+
+```yaml
+services:
+  # ... your existing services ...
+
+  docs2image-output:
+    image: nginx:alpine
+    restart: always
+    volumes:
+      - /path/to/docs2image/output:/usr/share/nginx/html:ro
+    command: >
+      sh -c "echo 'server { listen 80; location / { root /usr/share/nginx/html; autoindex on; autoindex_exact_size off; autoindex_localtime on; } }' > /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.docs2image.rule=Host(`${YOUR_DOMAIN}`) && PathPrefix(`/output`)
+      - traefik.http.routers.docs2image.entrypoints=websecure
+      - traefik.http.routers.docs2image.tls=true
+      - traefik.http.routers.docs2image.tls.certresolver=mytlschallenge
+      - traefik.http.middlewares.docs2image-strip.stripprefix.prefixes=/output
+      - traefik.http.routers.docs2image.middlewares=docs2image-strip
+      - traefik.http.services.docs2image.loadbalancer.server.port=80
+```
+
+**Configuration notes:**
+- Replace `/path/to/docs2image/output` with the actual path to your docs2image output directory
+- Replace `${YOUR_DOMAIN}` with your domain or use an environment variable
+- The `autoindex on` directive enables directory listing
+- The `stripprefix` middleware removes `/output` from the URL path before passing to nginx
+
+**Deploy:**
+```bash
+docker compose up -d docs2image-output
+```
+
+**Access:**
+```
+https://your-domain.com/output/
+https://your-domain.com/output/{session_id}/page_001.png
+```
+
 ## Output Structure
 
 ```
