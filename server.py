@@ -9,6 +9,7 @@ import os
 import subprocess
 import tempfile
 import uuid
+import zipfile
 from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile
@@ -19,11 +20,82 @@ app = FastAPI(title="docs2image", description="PDF/PPTX to PNG converter")
 
 BASE_DIR = Path(__file__).parent.resolve()
 OUTPUT_DIR = BASE_DIR / "output"
+FONTS_DIR = BASE_DIR / "fonts"
 
 # Configuration via environment variables
 HOST = os.environ.get("DOCS2IMAGE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("DOCS2IMAGE_PORT", "8085"))
 DPI = int(os.environ.get("DOCS2IMAGE_DPI", "200"))
+
+
+def _deobfuscate_odttf(data: bytes, rel_id: str) -> bytes:
+    """Deobfuscate an .odttf font per OOXML spec (ECMA-376 Part 1 §14.2.7.2).
+
+    The first 32 bytes are XOR'd with the font relationship ID GUID (reversed).
+    """
+    guid_hex = rel_id.strip("{}").replace("-", "")
+    key = bytes(int(guid_hex[i:i+2], 16) for i in range(0, 32, 2))
+    key = bytes(reversed(key))
+    head = bytes(b ^ key[i % 16] for i, b in enumerate(data[:32]))
+    return head + data[32:]
+
+
+def extract_pptx_fonts(pptx_path: Path) -> list[str]:
+    """Extract fonts embedded in a PPTX file and install them for LibreOffice.
+
+    Handles both plain (.ttf/.otf) and obfuscated (.odttf) embedded fonts.
+    Fonts are saved to BASE_DIR/fonts/ and the font cache is rebuilt only
+    when new fonts are found.
+
+    Returns list of newly installed font filenames.
+    """
+    FONTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Build a map of relationship IDs to font files from the PPTX rels
+    rel_id_map: dict[str, str] = {}
+    new_fonts = []
+
+    with zipfile.ZipFile(pptx_path, 'r') as zf:
+        # Parse font relationship IDs from ppt/_rels/presentation.xml.rels
+        rels_path = "ppt/_rels/presentation.xml.rels"
+        if rels_path in zf.namelist():
+            import xml.etree.ElementTree as ET
+            tree = ET.fromstring(zf.read(rels_path))
+            ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+            for rel in tree.findall(f"{{{ns}}}Relationship"):
+                target = rel.get("Target", "")
+                rel_id = rel.get("Id", "")
+                if "/fonts/" in target and rel_id:
+                    rel_id_map[target.lstrip("/")] = rel_id
+
+        font_entries = [
+            f for f in zf.namelist()
+            if f.startswith("ppt/fonts/") and Path(f).suffix.lower() in (".ttf", ".otf", ".odttf", ".fntdata")
+        ]
+
+        for entry in font_entries:
+            suffix = Path(entry).suffix.lower()
+            # Determine output filename (deobfuscated odttf saves as .ttf)
+            stem = Path(entry).stem
+            out_name = stem + (".ttf" if suffix == ".odttf" else suffix)
+            dest = FONTS_DIR / out_name
+
+            if not dest.exists():
+                data = zf.read(entry)
+                if suffix == ".odttf":
+                    rel_id = rel_id_map.get(entry, "")
+                    if rel_id:
+                        data = _deobfuscate_odttf(data, rel_id)
+                    else:
+                        # No rel ID found — skip, can't deobfuscate reliably
+                        continue
+                dest.write_bytes(data)
+                new_fonts.append(out_name)
+
+    if new_fonts:
+        subprocess.run(["fc-cache", "-f", str(FONTS_DIR)], capture_output=True)
+
+    return new_fonts
 
 
 def convert_pptx_to_pdf(pptx_path: Path) -> Path:
@@ -46,7 +118,7 @@ def convert_pptx_to_pdf(pptx_path: Path) -> Path:
         str(pptx_path)
     ]
 
-    env = {**os.environ, "HOME": "/tmp"}
+    env = {**os.environ, "HOME": "/tmp", "XDG_DATA_HOME": str(BASE_DIR)}
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
 
     if result.returncode != 0:
@@ -132,6 +204,7 @@ async def convert_document(file: UploadFile = File(...)):
         try:
             # Convert PPTX to PDF if needed
             if ext == ".pptx":
+                extract_pptx_fonts(input_path)
                 temp_pdf_path = convert_pptx_to_pdf(input_path)
                 pdf_path = temp_pdf_path
             else:

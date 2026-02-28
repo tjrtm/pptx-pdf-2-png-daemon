@@ -21,9 +21,79 @@ import subprocess
 import sys
 import tempfile
 import uuid
+import zipfile
 from pathlib import Path
 
 from pdf2image import convert_from_path
+
+SCRIPT_DIR = Path(__file__).parent.resolve()
+FONTS_DIR = SCRIPT_DIR / "fonts"
+
+
+def _deobfuscate_odttf(data: bytes, rel_id: str) -> bytes:
+    """Deobfuscate an .odttf font per OOXML spec (ECMA-376 Part 1 §14.2.7.2).
+
+    The first 32 bytes are XOR'd with the font relationship ID GUID (reversed).
+    """
+    guid_hex = rel_id.strip("{}").replace("-", "")
+    key = bytes(int(guid_hex[i:i+2], 16) for i in range(0, 32, 2))
+    key = bytes(reversed(key))
+    head = bytes(b ^ key[i % 16] for i, b in enumerate(data[:32]))
+    return head + data[32:]
+
+
+def extract_pptx_fonts(pptx_path: Path) -> list[str]:
+    """Extract fonts embedded in a PPTX file and install them for LibreOffice.
+
+    Handles both plain (.ttf/.otf) and obfuscated (.odttf) embedded fonts.
+    Fonts are saved to BASE_DIR/fonts/ and the font cache is rebuilt only
+    when new fonts are found.
+
+    Returns list of newly installed font filenames.
+    """
+    FONTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    rel_id_map: dict[str, str] = {}
+    new_fonts = []
+
+    with zipfile.ZipFile(pptx_path, 'r') as zf:
+        rels_path = "ppt/_rels/presentation.xml.rels"
+        if rels_path in zf.namelist():
+            import xml.etree.ElementTree as ET
+            tree = ET.fromstring(zf.read(rels_path))
+            ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+            for rel in tree.findall(f"{{{ns}}}Relationship"):
+                target = rel.get("Target", "")
+                rel_id = rel.get("Id", "")
+                if "/fonts/" in target and rel_id:
+                    rel_id_map[target.lstrip("/")] = rel_id
+
+        font_entries = [
+            f for f in zf.namelist()
+            if f.startswith("ppt/fonts/") and Path(f).suffix.lower() in (".ttf", ".otf", ".odttf", ".fntdata")
+        ]
+
+        for entry in font_entries:
+            suffix = Path(entry).suffix.lower()
+            stem = Path(entry).stem
+            out_name = stem + (".ttf" if suffix == ".odttf" else suffix)
+            dest = FONTS_DIR / out_name
+
+            if not dest.exists():
+                data = zf.read(entry)
+                if suffix == ".odttf":
+                    rel_id = rel_id_map.get(entry, "")
+                    if rel_id:
+                        data = _deobfuscate_odttf(data, rel_id)
+                    else:
+                        continue
+                dest.write_bytes(data)
+                new_fonts.append(out_name)
+
+    if new_fonts:
+        subprocess.run(["fc-cache", "-f", str(FONTS_DIR)], capture_output=True)
+
+    return new_fonts
 
 
 def convert_pptx_to_pdf(pptx_path: Path) -> Path:
@@ -125,6 +195,9 @@ def main():
 
     try:
         if extension == ".pptx":
+            new_fonts = extract_pptx_fonts(input_path)
+            if new_fonts:
+                print(f"Installed embedded fonts: {', '.join(new_fonts)}")
             print(f"Converting PPTX to PDF...")
             temp_pdf_path = convert_pptx_to_pdf(input_path)
             pdf_path = temp_pdf_path
