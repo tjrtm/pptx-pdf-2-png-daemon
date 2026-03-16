@@ -1,6 +1,27 @@
-.claude
-/venv/
-venv/
+# Python
 __pycache__/
-output/*/*.png
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
 
+# Virtual environment
+venv/
+
+# Output images (session data)
+output/*/*.png
+output/test_result.png
+
+# Generated configs
+*.generated
+apache-docs2image.conf
+
+# IDE
+.vscode/
+.idea/
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
