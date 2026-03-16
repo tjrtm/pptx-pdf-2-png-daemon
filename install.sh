@@ -65,6 +65,12 @@ if ! command -v apache2 &> /dev/null; then
     MISSING_DEPS+=("apache2")
 fi
 
+# Check for Microsoft core fonts (important for PPTX rendering)
+if ! fc-list : family | grep -qi "arial"; then
+    echo -e "${YELLOW}NOTE:${NC} Microsoft core fonts not found. Recommended for accurate PPTX rendering."
+    MISSING_DEPS+=("ttf-mscorefonts-installer fonts-liberation")
+fi
+
 if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
     echo ""
     echo -e "${YELLOW}Missing dependencies:${NC}"
@@ -86,6 +92,10 @@ echo ""
 
 # Create virtual environment
 echo "Creating Python virtual environment..."
+if [ -d "$SCRIPT_DIR/venv" ]; then
+    echo "Existing venv found, recreating..."
+    rm -rf "$SCRIPT_DIR/venv"
+fi
 python3 -m venv "$SCRIPT_DIR/venv"
 
 # Install Python dependencies
@@ -100,6 +110,11 @@ echo ""
 echo "Creating output directory..."
 mkdir -p "$SCRIPT_DIR/output"
 
+# Create user font directory (for PPTX embedded fonts)
+echo "Creating font directory..."
+mkdir -p "$HOME/.local/share/fonts/pptx-extracted"
+fc-cache -f "$HOME/.local/share/fonts/pptx-extracted" 2>/dev/null || true
+
 # Set permissions for web server access
 echo "Setting permissions..."
 chmod o+x "$(dirname "$SCRIPT_DIR")" 2>/dev/null || true
@@ -108,24 +123,11 @@ chmod -R o+rX "$SCRIPT_DIR/output"
 
 # Generate systemd service file
 echo "Generating systemd service file..."
-cat > "$SCRIPT_DIR/docs2image.service" << EOF
-[Unit]
-Description=docs2image - PDF/PPTX to PNG converter service
-After=network.target
-
-[Service]
-Type=simple
-User=$SERVICE_USER
-WorkingDirectory=$SCRIPT_DIR
-Environment="DOCS2IMAGE_HOST=$API_HOST"
-Environment="DOCS2IMAGE_PORT=$API_PORT"
-ExecStart=$SCRIPT_DIR/venv/bin/uvicorn server:app --host $API_HOST --port $API_PORT
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
+sed -e "s|%USER%|$SERVICE_USER|g" \
+    -e "s|%INSTALL_DIR%|$SCRIPT_DIR|g" \
+    -e "s|%API_HOST%|$API_HOST|g" \
+    -e "s|%API_PORT%|$API_PORT|g" \
+    "$SCRIPT_DIR/docs2image.service" > "$SCRIPT_DIR/docs2image.service.generated"
 
 # Generate Apache config
 echo "Generating Apache configuration..."
@@ -157,16 +159,13 @@ echo ""
 echo "Next steps:"
 echo ""
 echo "1. Install the systemd service:"
-echo "   sudo cp $SCRIPT_DIR/docs2image.service /etc/systemd/system/"
+echo "   sudo cp $SCRIPT_DIR/docs2image.service.generated /etc/systemd/system/docs2image.service"
 echo "   sudo systemctl daemon-reload"
 echo "   sudo systemctl enable docs2image"
 echo "   sudo systemctl start docs2image"
 echo ""
 echo "2. Configure Apache to serve output images:"
-echo "   # Set Apache to listen on port $WEB_PORT (edit /etc/apache2/ports.conf):"
 echo "   echo 'Listen $WEB_PORT' | sudo tee -a /etc/apache2/ports.conf"
-echo ""
-echo "   # Install the site:"
 echo "   sudo cp $SCRIPT_DIR/apache-docs2image.conf /etc/apache2/sites-available/"
 echo "   sudo a2ensite apache-docs2image.conf"
 echo "   sudo systemctl reload apache2"

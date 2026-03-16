@@ -1,0 +1,24 @@
+# Example: Serve docs2image output via Nginx + Traefik
+#
+# Add this service to your existing docker-compose.yml.
+# Replace /path/to/docs2image/output and YOUR_DOMAIN.
+
+services:
+  docs2image-output:
+    image: nginx:alpine
+    restart: always
+    volumes:
+      - /path/to/docs2image/output:/usr/share/nginx/html:ro
+    command: >
+      sh -c "echo 'server { listen 80; location / { root /usr/share/nginx/html;
+      autoindex on; autoindex_exact_size off; autoindex_localtime on; } }'
+      > /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.docs2image.rule=Host(`${YOUR_DOMAIN}`) && PathPrefix(`/output`)
+      - traefik.http.routers.docs2image.entrypoints=websecure
+      - traefik.http.routers.docs2image.tls=true
+      - traefik.http.routers.docs2image.tls.certresolver=mytlschallenge
+      - traefik.http.middlewares.docs2image-strip.stripprefix.prefixes=/output
+      - traefik.http.routers.docs2image.middlewares=docs2image-strip
+      - traefik.http.services.docs2image.loadbalancer.server.port=80
