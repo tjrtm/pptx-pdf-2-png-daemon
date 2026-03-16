@@ -3,6 +3,7 @@
 docs2image HTTP service - Convert PDF or PPTX files to PNG images.
 
 Accepts multipart form-data file uploads.
+Serves a web UI for testing and browsing converted images.
 """
 
 import logging
@@ -12,7 +13,8 @@ import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from font_utils import extract_pptx_fonts, check_missing_fonts
 from lo_export import convert_pptx_to_images, convert_pdf_to_images
@@ -28,16 +30,54 @@ app = FastAPI(title="docs2image", description="PDF/PPTX to PNG converter")
 
 BASE_DIR = Path(__file__).parent.parent.resolve()
 OUTPUT_DIR = BASE_DIR / "output"
+STATIC_DIR = BASE_DIR / "static"
 
 # Configuration via environment variables
 HOST = os.environ.get("DOCS2IMAGE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("DOCS2IMAGE_PORT", "8085"))
 DPI = int(os.environ.get("DOCS2IMAGE_DPI", "200"))
 
+# Mount output directory for serving images
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/output", StaticFiles(directory=str(OUTPUT_DIR)), name="output")
+
+# Mount static assets
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard():
+    """Serve the main dashboard page."""
+    index_path = STATIC_DIR / "index.html"
+    if index_path.exists():
+        return HTMLResponse(content=index_path.read_text())
+    return HTMLResponse(content="<h1>docs2image</h1><p>Static files not found.</p>")
+
 
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+
+@app.get("/sessions")
+def list_sessions():
+    """List all conversion sessions with their images."""
+    sessions = []
+    if OUTPUT_DIR.exists():
+        for session_dir in sorted(OUTPUT_DIR.iterdir(), reverse=True):
+            if session_dir.is_dir():
+                images = sorted(session_dir.glob("page_*.png"))
+                if images:
+                    sessions.append({
+                        "session_id": session_dir.name,
+                        "images": [
+                            f"/output/{session_dir.name}/{img.name}"
+                            for img in images
+                        ],
+                        "count": len(images),
+                    })
+    return {"sessions": sessions}
 
 
 @app.post("/convert")
@@ -117,7 +157,10 @@ async def convert_document(file: UploadFile = File(...)):
             return {
                 "success": True,
                 "session_id": session_id,
-                "images": [str(p) for p in image_paths],
+                "filename": filename,
+                "images": [
+                    f"/output/{session_id}/{p.name}" for p in image_paths
+                ],
                 "count": len(image_paths),
             }
 
