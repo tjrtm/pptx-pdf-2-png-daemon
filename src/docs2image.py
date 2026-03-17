@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from font_utils import extract_pptx_fonts, check_missing_fonts  # noqa: E402
 from lo_export import convert_pptx_to_images, convert_pdf_to_images  # noqa: E402
+from pptx_preprocess import preprocess_pptx  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -90,9 +91,17 @@ def main():
             if missing:
                 print(f"Warning: Missing fonts (will be substituted): {', '.join(missing)}")
 
+            # Pre-process to fix text overflow
+            processed_path, mods = preprocess_pptx(input_path)
+            if mods > 0:
+                print(f"Pre-processed: {mods} text boxes adjusted for LibreOffice compatibility")
+                convert_source = processed_path
+            else:
+                convert_source = input_path
+
             print("Converting PPTX to images...")
             image_paths = convert_pptx_to_images(
-                input_path, output_dir, dpi=args.dpi
+                convert_source, output_dir, dpi=args.dpi
             )
         else:
             print(f"Converting PDF to images at {args.dpi} DPI...")

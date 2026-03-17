@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 
 from font_utils import extract_pptx_fonts, check_missing_fonts
 from lo_export import convert_pptx_to_images, convert_pdf_to_images
+from pptx_preprocess import preprocess_pptx
 
 # Configure logging
 logging.basicConfig(
@@ -144,9 +145,17 @@ async def convert_document(file: UploadFile = File(...)):
                         ", ".join(missing),
                     )
 
+                # Pre-process PPTX to fix text overflow
+                processed_path, mods = preprocess_pptx(input_path)
+                if mods > 0:
+                    logger.info("Pre-processed PPTX: %d text boxes adjusted", mods)
+                    convert_source = processed_path
+                else:
+                    convert_source = input_path
+
                 # Convert PPTX directly to images
                 image_paths = convert_pptx_to_images(
-                    input_path, session_dir, dpi=DPI
+                    convert_source, session_dir, dpi=DPI
                 )
             else:
                 # PDF: render directly to images
