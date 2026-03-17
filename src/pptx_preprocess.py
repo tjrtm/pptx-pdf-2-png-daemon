@@ -20,11 +20,12 @@ from pathlib import Path
 logger = logging.getLogger("pptx_preprocess")
 
 # LibreOffice renders text wider than raw glyph metrics.
-# Measured empirically: ~13% wider, with 5% safety margin.
-LO_WIDTH_FACTOR = 1.18
+# Measured empirically: ~13% wider for Aptos, ~13% for Arial.
+# Using 1.15 with noAutofit forced gives reliable results.
+LO_WIDTH_FACTOR = 1.15
 
-# Don't shrink fonts smaller than this factor of original (max 18% reduction)
-MIN_SCALE = 0.82
+# Don't shrink fonts smaller than this factor of original (max 30% reduction)
+MIN_SCALE = 0.70
 
 # Only process fonts this size or larger (points) — small text rarely overflows visibly
 MIN_FONT_SIZE_PT = 14
@@ -328,24 +329,35 @@ def _process_slide_xml(
             if not full_text:
                 continue
 
-            # If no explicit font size found, use master defaults
+            # If no explicit font size found, estimate from context
             if font_size_pt is None:
-                # Guess whether this is title-like text based on characteristics:
-                # - All uppercase
+                # Detect title-like text:
+                # - All uppercase or mostly uppercase
                 # - Short text (< 80 chars)
-                # - Large shape
+                # - Wide shape (> 500pt usable)
+                upper_ratio = sum(1 for c in full_text if c.isupper()) / max(len(full_text), 1)
                 is_title_like = (
-                    full_text.isupper()
-                    or len(full_text) < 60
-                    or usable_width_pt > 500
+                    upper_ratio > 0.6
+                    or (len(full_text) < 60 and usable_width_pt > 400)
                 )
-                default_key = "title" if is_title_like else "body"
-                font_size_pt = default_sizes.get(default_key, 1800) / 100
+
+                if is_title_like:
+                    # Title text in PPTX typically renders at 44pt
+                    # Use the master's largest font size, or 44pt as fallback
+                    title_sz = default_sizes.get("title", 4400)
+                    if title_sz < 2000:
+                        # Master default seems too small — override with 44pt
+                        title_sz = 4400
+                    font_size_pt = title_sz / 100
+                else:
+                    body_sz = default_sizes.get("body", 1800)
+                    font_size_pt = body_sz / 100
+
                 logger.debug(
-                    "Using default font size %.0fpt for '%s' (key=%s)",
+                    "Estimated font size %.0fpt for '%s' (title=%s)",
                     font_size_pt,
                     full_text[:40],
-                    default_key,
+                    is_title_like,
                 )
 
             if font_size_pt < MIN_FONT_SIZE_PT:
@@ -415,7 +427,7 @@ def _process_slide_xml(
                 # Calculate scale to fit
                 scale = 1.0 / max_overflow_ratio
                 scale = max(scale, MIN_SCALE)  # don't shrink too much
-                scale *= 0.97  # extra 3% safety margin
+                scale *= 0.95  # extra 5% safety margin for LO rendering variance
 
                 new_size_hundredths = int(font_size_pt * scale * 100)
 
@@ -448,6 +460,18 @@ def _process_slide_xml(
                     defRPr = pPr.find(f"{{{DRAWINGML_NS}}}defRPr")
                     if defRPr is not None and defRPr.get("sz"):
                         defRPr.set("sz", str(new_size_hundredths))
+
+                # CRITICAL: Remove normAutofit/spAutoFit from bodyPr
+                # LibreOffice's autofit may override our explicit font size
+                if bodyPr is not None:
+                    for autofit_tag in ("normAutofit", "spAutoFit"):
+                        af = bodyPr.find(f"{{{DRAWINGML_NS}}}{autofit_tag}")
+                        if af is not None:
+                            bodyPr.remove(af)
+                    # Replace with noAutofit to force our size
+                    no_af = bodyPr.find(f"{{{DRAWINGML_NS}}}noAutofit")
+                    if no_af is None:
+                        ET.SubElement(bodyPr, f"{{{DRAWINGML_NS}}}noAutofit")
 
                 modifications += 1
 

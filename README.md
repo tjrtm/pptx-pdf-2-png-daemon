@@ -1,16 +1,18 @@
 # docs2image
 
-HTTP service and CLI tool that converts **PDF** and **PPTX** files to high-fidelity **PNG** images. Designed for headless server deployment with systemd, Apache/Nginx, and integration with automation tools like n8n.
+HTTP service and CLI tool that converts **PDF** and **PPTX** files to high-fidelity **PNG** images. Features smart text overflow correction and comprehensive font handling for accurate rendering of PowerPoint presentations on Linux.
 
 ## Key Features
 
 - Converts PDF and PPTX files to per-page PNG images
+- **Smart text overflow preprocessor** — detects and corrects text that would overflow in LibreOffice using actual font metrics
 - **Comprehensive font extraction** from PPTX — scans all relationship files, handles obfuscated `.odttf` fonts
 - **High-fidelity rendering** via LibreOffice + pdftoppm with font anti-aliasing
+- **Web UI** with drag-drop upload, image gallery, lightbox viewer, and live conversion log
 - REST API with multipart form-data uploads
 - CLI tool for local/batch use
-- Automatic Docker bridge detection for container access
-- systemd service + web server for production
+- Missing font detection and warnings
+- systemd service for production deployment
 
 ## Quick Start
 
@@ -21,19 +23,24 @@ cd pptx-pdf-2-png-daemon
 
 # 2. Install system dependencies
 sudo apt install python3 python3-venv poppler-utils libreoffice-impress
-sudo apt install ttf-mscorefonts-installer fonts-liberation  # recommended
 
-# 3. Run the installer
+# 3. Install Microsoft 365 fonts (REQUIRED for accurate PPTX rendering)
+git clone --depth 1 https://github.com/pjobson/Microsoft-365-Fonts.git /tmp/ms-fonts
+mkdir -p ~/.local/share/fonts/ms365
+find /tmp/ms-fonts -name "*.ttf" -exec cp {} ~/.local/share/fonts/ms365/ \;
+fc-cache -f
+rm -rf /tmp/ms-fonts
+
+# 4. Run the installer
 ./install.sh
 
-# 4. Start the service
+# 5. Start the service
 sudo cp docs2image.service.generated /etc/systemd/system/docs2image.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now docs2image
 
-# 5. Test
-curl http://localhost:8085/health
-curl -X POST http://localhost:8085/convert -F "file=@presentation.pptx"
+# 6. Open the web UI
+# http://localhost:8085
 ```
 
 ## System Requirements
@@ -41,17 +48,22 @@ curl -X POST http://localhost:8085/convert -F "file=@presentation.pptx"
 - Python 3.10+
 - poppler-utils (provides `pdftoppm`)
 - libreoffice-impress (PPTX → PDF conversion)
-- Apache2 or Nginx (optional, for serving output images)
+- **Microsoft 365 fonts** — see [docs/fonts.md](docs/fonts.md)
+- Apache2 or Nginx (optional, for serving output images on a separate port)
 
-### Recommended Fonts
+## How It Works
 
-For accurate PPTX rendering, install Microsoft core fonts:
-
-```bash
-sudo apt install ttf-mscorefonts-installer fonts-liberation fonts-noto
+```mermaid
+flowchart LR
+    A[Upload PPTX] --> B[Extract embedded fonts]
+    B --> C[Check text overflow<br/>using font metrics]
+    C --> D[Fix overflowing text boxes]
+    D --> E[LibreOffice → PDF]
+    E --> F[pdftoppm → PNG]
+    F --> G[Per-page PNGs]
 ```
 
-See [docs/fonts.md](docs/fonts.md) for details on font handling.
+For the full architecture, see [docs/architecture.md](docs/architecture.md).
 
 ## Project Structure
 
@@ -59,20 +71,23 @@ See [docs/fonts.md](docs/fonts.md) for details on font handling.
 docs2image/
 ├── run.py                  # HTTP service entry point
 ├── install.sh              # Automated installer
-├── requirements.txt        # Python dependencies (FastAPI, uvicorn)
+├── requirements.txt        # Python dependencies
 ├── docs2image.service      # systemd unit template
 ├── src/
-│   ├── server.py           # FastAPI HTTP service
+│   ├── server.py           # FastAPI HTTP service + web UI
 │   ├── docs2image.py       # CLI tool
 │   ├── font_utils.py       # Font extraction & management
-│   └── lo_export.py        # LibreOffice export pipeline
+│   ├── lo_export.py        # LibreOffice export pipeline
+│   └── pptx_preprocess.py  # Text overflow preprocessor
+├── static/
+│   └── index.html          # Web UI dashboard
 ├── docs/                   # Documentation
 │   ├── architecture.md     # System design & data flow diagrams
-│   ├── fonts.md            # Font handling & troubleshooting
-│   └── upgrading.md        # Migration guide from v1.x
+│   ├── fonts.md            # Font installation & troubleshooting
+│   └── upgrading.md        # Migration guide
 ├── examples/               # Integration examples
-│   ├── n8n-integration.md  # n8n workflow setup
-│   └── docker-compose.yml  # Traefik/Nginx serving config
+│   ├── n8n-integration.md
+│   └── docker-compose.yml
 └── output/                 # Generated images (per session UUID)
 ```
 
@@ -83,7 +98,7 @@ docs2image/
 Convert a PDF or PPTX file to PNG images.
 
 ```bash
-curl -X POST http://localhost:8085/convert -F "file=@document.pptx"
+curl -X POST http://localhost:8085/convert -F "file=@presentation.pptx"
 ```
 
 **Response:**
@@ -91,12 +106,12 @@ curl -X POST http://localhost:8085/convert -F "file=@document.pptx"
 ```json
 {
   "success": true,
-  "session_id": "a1b2c3d4-5678-90ab-cdef-1234567890ab",
-  "images": [
-    "/path/to/output/a1b2c3d4-.../page_001.png",
-    "/path/to/output/a1b2c3d4-.../page_002.png"
-  ],
-  "count": 2
+  "session_id": "a1b2c3d4-5678-...",
+  "filename": "presentation.pptx",
+  "images": ["/output/a1b2c3d4-.../page_001.png", "..."],
+  "count": 17,
+  "missing_fonts": [],
+  "new_fonts": []
 }
 ```
 
@@ -104,101 +119,74 @@ curl -X POST http://localhost:8085/convert -F "file=@document.pptx"
 
 ```bash
 curl http://localhost:8085/health
-# {"status": "ok"}
 ```
+
+### GET /sessions
+
+List all conversion sessions.
+
+### GET /
+
+Web UI dashboard with upload, gallery, and conversion log.
 
 ## CLI Usage
 
 ```bash
-# Activate the virtual environment
 source venv/bin/activate
 
 # Convert PPTX
-python src/docs2image.py presentation.pptx
+PYTHONPATH=src python src/docs2image.py presentation.pptx
 
 # Convert PDF at 300 DPI
-python src/docs2image.py document.pdf --dpi 300
+PYTHONPATH=src python src/docs2image.py document.pdf --dpi 300
 
-# Verbose output (shows font extraction details)
-python src/docs2image.py presentation.pptx --verbose
+# Verbose output (shows font details)
+PYTHONPATH=src python src/docs2image.py presentation.pptx --verbose
 ```
 
 ## Configuration
 
-| Environment Variable   | Default     | Description                                        |
-| ---------------------- | ----------- | -------------------------------------------------- |
-| `DOCS2IMAGE_HOST`      | `127.0.0.1` | API bind address (auto-detected for Docker)       |
-| `DOCS2IMAGE_PORT`      | `8085`      | API port                                           |
-| `DOCS2IMAGE_WEB_PORT`  | `8080`      | Apache/Nginx web server port (installer only)      |
-| `DOCS2IMAGE_DPI`       | `200`       | Output image resolution                            |
+| Environment Variable   | Default     | Description                                   |
+| ---------------------- | ----------- | --------------------------------------------- |
+| `DOCS2IMAGE_HOST`      | `127.0.0.1` | API bind address (auto-detected for Docker)  |
+| `DOCS2IMAGE_PORT`      | `8085`      | API port                                      |
+| `DOCS2IMAGE_DPI`       | `200`       | Output image resolution                       |
 
-## How It Works
+## Updating an Existing Installation
 
-```mermaid
-flowchart LR
-    A[Upload PPTX] --> B[Extract embedded fonts]
-    B --> C[Install fonts + fc-cache]
-    C --> D[LibreOffice → PDF<br/>with font embedding]
-    D --> E[pdftoppm → PNG<br/>with anti-aliasing]
-    E --> F[Per-page PNGs]
-```
+See [docs/upgrading.md](docs/upgrading.md) for step-by-step instructions.
 
-For the full architecture with sequence diagrams, see [docs/architecture.md](docs/architecture.md).
-
-## Serving Output Images
-
-### Apache
+**Quick update:**
 
 ```bash
-echo 'Listen 8080' | sudo tee -a /etc/apache2/ports.conf
-sudo cp apache-docs2image.conf /etc/apache2/sites-available/
-sudo a2ensite apache-docs2image.conf
-sudo systemctl reload apache2
-```
-
-### Docker + Traefik
-
-See [examples/docker-compose.yml](examples/docker-compose.yml).
-
-### URL Pattern
-
-```
-http://<server>:8080/{session_id}/page_001.png
-```
-
-## Service Management
-
-```bash
-sudo systemctl start docs2image
 sudo systemctl stop docs2image
-sudo systemctl restart docs2image
-sudo systemctl status docs2image
-journalctl -u docs2image -f
+cd /path/to/docs2image
+git pull origin main
+rm -rf venv && python3 -m venv venv && venv/bin/pip install -r requirements.txt
+sudo cp docs2image.service.generated /etc/systemd/system/docs2image.service
+sudo systemctl daemon-reload && sudo systemctl start docs2image
 ```
 
-## Upgrading
-
-See [docs/upgrading.md](docs/upgrading.md) for migration instructions from previous versions.
+**⚠️ Don't forget fonts!** See [docs/fonts.md](docs/fonts.md). Without Microsoft 365 fonts, text will render incorrectly.
 
 ## Troubleshooting
 
-### Fonts look wrong in PPTX output
+### Text overflows or looks wrong
 
-Install Microsoft core fonts and check for missing font warnings:
+Install Microsoft 365 fonts — this fixes 95% of rendering issues:
 
 ```bash
-sudo apt install ttf-mscorefonts-installer fonts-liberation
-python src/docs2image.py presentation.pptx --verbose
+git clone --depth 1 https://github.com/pjobson/Microsoft-365-Fonts.git /tmp/ms-fonts
+mkdir -p ~/.local/share/fonts/ms365
+find /tmp/ms-fonts -name "*.ttf" -exec cp {} ~/.local/share/fonts/ms365/ \;
+fc-cache -f
 ```
 
-### LibreOffice conversion fails
+Check for missing fonts:
 
 ```bash
-# Check LibreOffice is installed
-soffice --version
-
-# Check for lock files
-rm -f /tmp/.~lock.*
+PYTHONPATH=src python src/docs2image.py presentation.pptx --verbose
+# Look for "Missing fonts:" in output
 ```
 
 ### Service won't start
@@ -209,11 +197,9 @@ journalctl -u docs2image -n 50
 
 ### Cannot access from Docker
 
-Verify the service binds to the Docker bridge IP:
-
 ```bash
 ss -tlnp | grep 8085
-# Should show 172.17.0.1:8085
+# Should show 0.0.0.0:8085 or 172.17.0.1:8085
 ```
 
 ## License

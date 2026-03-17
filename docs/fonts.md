@@ -1,16 +1,69 @@
 # Font Handling Guide
 
-## The Problem
+## Why Fonts Matter
 
-PPTX files created in PowerPoint on Windows/macOS often use fonts that aren't available on Linux:
+PPTX files reference fonts by name. When the exact font isn't available on the server, LibreOffice substitutes a different font with different character widths. This causes text to overflow boxes, wrap differently, or look wrong.
 
-- **Microsoft core fonts**: Arial, Times New Roman, Courier New, Calibri, etc.
-- **Custom/commercial fonts**: embedded in the PPTX as obfuscated `.odttf` files
-- **CJK and international fonts**: referenced by slide masters and themes
+**The single most important thing for accurate PPTX rendering is having the right fonts installed.**
 
-When LibreOffice can't find a font, it substitutes a fallback — and the fallback has different character widths, line heights, and kerning. This causes text to overflow boxes, wrap differently, or look wrong.
+## Required Font Installation
 
-## How docs2image Solves This
+### Microsoft 365 Fonts (REQUIRED)
+
+Most PPTX files use Microsoft fonts (Arial, Calibri, Aptos, Times New Roman, etc.). Install the full set:
+
+```bash
+# Clone the font collection
+git clone --depth 1 https://github.com/pjobson/Microsoft-365-Fonts.git /tmp/ms-fonts
+
+# Install to user font directory
+mkdir -p ~/.local/share/fonts/ms365
+find /tmp/ms-fonts -name "*.ttf" -exec cp {} ~/.local/share/fonts/ms365/ \;
+
+# Rebuild font cache
+fc-cache -f
+
+# Clean up
+rm -rf /tmp/ms-fonts
+```
+
+This installs ~2100 fonts including:
+- **Aptos / Aptos Display** — new Microsoft 365 default (since 2023)
+- **Calibri** — previous Office default
+- **Arial, Times New Roman, Courier New** — classic fonts
+- **Segoe UI** — Windows system font
+- All CJK and international fonts
+
+### Google Fonts (as needed)
+
+Some presentations use Google Fonts. Install individually:
+
+```bash
+# Example: Play font
+curl -sL "https://github.com/google/fonts/raw/main/ofl/play/Play-Regular.ttf" \
+  -o ~/.local/share/fonts/ms365/Play-Regular.ttf
+curl -sL "https://github.com/google/fonts/raw/main/ofl/play/Play-Bold.ttf" \
+  -o ~/.local/share/fonts/ms365/Play-Bold.ttf
+fc-cache -f
+```
+
+### Verifying Font Installation
+
+```bash
+# Check specific fonts
+fc-match "Arial"           # → Arial.ttf: "Arial" "Regular"
+fc-match "Aptos Display"   # → Aptos Display.ttf: "Aptos" "Display"
+fc-match "Play"            # → Play-Regular.ttf: "Play" "Regular"
+
+# List all installed font families
+fc-list --format="%{family}\n" | sort -u | wc -l
+
+# Check which fonts a PPTX needs
+PYTHONPATH=src python src/docs2image.py presentation.pptx --verbose
+# Look for "Missing fonts:" in the output
+```
+
+## How Font Extraction Works
 
 ```mermaid
 flowchart TD
@@ -25,102 +78,51 @@ flowchart TD
 
     F --> G[fc-cache rebuild]
     G --> H[Check missing fonts]
-    H --> I[LibreOffice conversion<br/>with installed fonts]
+    H --> I{Any missing?}
+    I -->|Yes| J[Log warning]
+    I -->|No| K[All fonts available ✓]
 ```
 
-### Step 1: Comprehensive Font Extraction
+docs2image scans **every** `.rels` file in the PPTX archive for embedded fonts — not just `presentation.xml.rels`. This catches fonts referenced from slides, slide masters, layouts, and themes.
 
-Unlike basic approaches that only check `ppt/_rels/presentation.xml.rels`, docs2image scans **every** `.rels` file in the archive:
+## How the Text Overflow Preprocessor Works
 
-- `ppt/_rels/presentation.xml.rels`
-- `ppt/slides/_rels/slide*.xml.rels`
-- `ppt/slideMasters/_rels/slideMaster*.xml.rels`
-- `ppt/slideLayouts/_rels/slideLayout*.xml.rels`
-- `ppt/theme/_rels/theme*.xml.rels`
-- `[Content_Types].xml` (font MIME type declarations)
+Even with correct fonts installed, LibreOffice renders text ~13% wider than PowerPoint. The preprocessor compensates:
 
-It also finds fonts by file extension anywhere in the archive, not just under `ppt/fonts/`.
-
-### Step 2: ODTTF Deobfuscation
-
-PowerPoint obfuscates embedded fonts using the OOXML spec (ECMA-376 Part 1 §14.2.7.2). The first 32 bytes are XOR'd with a GUID derived from the font's relationship ID. docs2image:
-
-1. Builds a GUID map from all `.rels` files
-2. Matches each `.odttf`/`.fntdata` file to its GUID
-3. Falls back to filename matching if the path doesn't match exactly
-4. Validates the deobfuscated font by checking the TrueType/OpenType signature
-
-### Step 3: Font Installation
-
-Fonts are installed to `~/.local/share/fonts/pptx-extracted/` — the standard XDG user font directory. This is automatically picked up by:
-
-- **fontconfig** (`fc-cache`)
-- **LibreOffice** (reads fontconfig)
-- **Poppler/pdftoppm** (reads fontconfig)
-
-### Step 4: Missing Font Detection
-
-After extraction, docs2image parses all DrawingML XML to find every `typeface` reference and compares against `fc-list`. Missing fonts are logged as warnings.
-
-## Recommended System Fonts
-
-For best results on Ubuntu/Debian, install these packages:
-
-```bash
-# Microsoft core fonts (Arial, Times New Roman, Courier New, etc.)
-sudo apt install ttf-mscorefonts-installer
-
-# Liberation fonts (metric-compatible replacements)
-sudo apt install fonts-liberation
-
-# Additional recommended fonts
-sudo apt install fonts-dejavu fonts-noto fonts-freefont-ttf
+```mermaid
+flowchart TD
+    A[PPTX file] --> B[Parse all slides]
+    B --> C[For each text box:<br/>measure text width<br/>using fontTools glyph metrics]
+    C --> D{Text wider than<br/>container box?}
+    D -->|No| E[Keep original]
+    D -->|Yes| F[Calculate new font size<br/>to fit with safety margin]
+    F --> G[Set explicit font size<br/>on all text runs]
+    G --> H[Remove normAutofit<br/>to prevent LO override]
+    H --> I[Save modified PPTX]
 ```
 
-### Font Coverage
-
-| Package                       | Covers                                    |
-| ----------------------------- | ----------------------------------------- |
-| `ttf-mscorefonts-installer`   | Arial, Times New Roman, Courier New, etc. |
-| `fonts-liberation`             | Metric-compatible alternatives            |
-| `fonts-noto`                   | CJK and international scripts             |
-| `fonts-dejavu`                 | Extended Unicode coverage                 |
-
-## Verifying Font Availability
-
-```bash
-# Check if a specific font is available
-fc-list | grep -i "arial"
-
-# List all installed font families
-fc-list --format="%{family}\n" | sort -u
-
-# Check which fonts a PPTX needs (using the CLI tool)
-python src/docs2image.py presentation.pptx --verbose
-```
+The preprocessor uses actual glyph widths from installed font files (via fontTools) multiplied by an empirically measured LibreOffice expansion factor.
 
 ## Troubleshooting
 
 ### Text overflows boxes
 
-1. Check the missing fonts warning in the output
-2. Install the missing fonts or their metric-compatible alternatives
-3. Re-run the conversion
+1. Check the conversion log for "Missing fonts" warnings
+2. Install the missing fonts
+3. Run `fc-cache -f`
+4. Restart the service and re-convert
 
 ### Fonts look different but don't overflow
 
-LibreOffice may substitute a visually similar but metrically identical font. This is usually acceptable. For pixel-perfect output matching PowerPoint on Windows, you need the exact same fonts installed.
+LibreOffice may substitute a visually similar font. Install the exact font for pixel-perfect output.
 
 ### Embedded fonts not being extracted
 
-Run with `--verbose` to see which `.rels` files are being scanned and which fonts are found. If a font uses an unusual embedding method, file an issue.
+Run with `--verbose` to see font extraction details. Check if the font uses an unusual embedding method.
 
 ### fc-cache not picking up new fonts
 
 ```bash
-# Force rebuild all font caches
 fc-cache -f -v
-
-# Verify the font is registered
 fc-match "Font Name"
 ```

@@ -1,9 +1,5 @@
 # Architecture
 
-## System Overview
-
-docs2image is a headless document-to-image conversion service. It accepts PDF and PPTX files via a REST API and returns high-fidelity PNG images of each page/slide.
-
 ## Conversion Pipeline
 
 ```mermaid
@@ -20,71 +16,97 @@ flowchart LR
         F --> G[fc-cache rebuild]
     end
 
+    subgraph "Text Preprocessing"
+        G --> H[Measure text widths<br/>using fontTools]
+        H --> I{Overflow<br/>detected?}
+        I -->|Yes| J[Shrink font size<br/>Remove autofit]
+        I -->|No| K[Keep original]
+    end
+
     subgraph "PPTX → PNG"
-        G --> H[LibreOffice headless]
-        H -->|"PDF with embedded fonts"| I[pdftoppm]
+        J --> L[LibreOffice headless<br/>-env:UserInstallation]
+        K --> L
+        L -->|"PDF with embedded fonts"| M[pdftoppm]
     end
 
     subgraph "PDF → PNG"
-        C --> I
+        C --> M
     end
 
-    I -->|"per-page PNG"| J[Output directory]
+    M -->|"per-page PNG"| N[Output directory]
 ```
 
 ## Component Responsibilities
 
+| Module | Purpose |
+|--------|---------|
+| `server.py` | FastAPI HTTP service with upload, progress tracking, SSE |
+| `docs2image.py` | CLI tool with same conversion logic |
+| `font_utils.py` | Font extraction from PPTX, installation, missing font detection |
+| `lo_export.py` | LibreOffice PDF export with isolated profile, pdftoppm rendering |
+| `pptx_preprocess.py` | Text overflow detection and correction using fontTools |
+| `run.py` | Service entry point |
+| `static/index.html` | Web UI dashboard |
+
+## Key Design Decisions
+
+### LibreOffice Profile Isolation
+
+LibreOffice uses `-env:UserInstallation=file:///tmp/...` to avoid lock conflicts between concurrent conversions. **Critical**: we do NOT override `HOME`, because that breaks fontconfig's access to `~/.local/share/fonts/`.
+
+### Text Overflow Preprocessing
+
+LibreOffice renders text ~13% wider than PowerPoint. Rather than trying to modify LibreOffice's behavior, we pre-process the PPTX:
+
+1. Parse each slide's XML for text shapes
+2. Measure text width using actual glyph metrics from installed font files
+3. Compare against the visual container width (background rectangles)
+4. Shrink only the overflowing text boxes and disable `normAutofit`
+
+### Background Rectangle Detection
+
+PPTX title text often sits in a shape that spans the full slide, but visually appears inside a narrower colored banner. The preprocessor finds filled rectangles on each slide and constrains text width to the banner width, not the text shape width.
+
+## Data Flow (HTTP Request)
+
 ```mermaid
-graph TD
-    subgraph "src/"
-        S[server.py<br/>FastAPI HTTP service] --> FU[font_utils.py<br/>Font extraction & installation]
-        S --> LO[lo_export.py<br/>LibreOffice & pdftoppm]
-        CLI[docs2image.py<br/>CLI tool] --> FU
-        CLI --> LO
+sequenceDiagram
+    participant Client
+    participant Server as FastAPI
+    participant Fonts as font_utils
+    participant Pre as pptx_preprocess
+    participant LO as lo_export
+    participant LibreOffice as soffice
+    participant Poppler as pdftoppm
+
+    Client->>Server: POST /convert (multipart file)
+    Server->>Server: Validate file type & size
+
+    alt PPTX file
+        Server->>Fonts: extract_pptx_fonts()
+        Fonts-->>Server: new font list
+
+        Server->>Fonts: check_missing_fonts()
+        Fonts-->>Server: missing font warnings
+
+        Server->>Pre: preprocess_pptx()
+        Pre->>Pre: Measure text, detect overflow
+        Pre-->>Server: modified PPTX + modification count
+
+        Server->>LO: convert_pptx_to_images()
+        LO->>LibreOffice: soffice -env:UserInstallation=... --convert-to pdf
+        LibreOffice-->>LO: PDF file
+        LO->>Poppler: pdftoppm -png -r DPI
+        Poppler-->>LO: PNG files
+    else PDF file
+        Server->>LO: convert_pdf_to_images()
+        LO->>Poppler: pdftoppm -png -r DPI
+        Poppler-->>LO: PNG files
     end
 
-    subgraph "External"
-        LO --> SOFFICE[soffice<br/>LibreOffice headless]
-        LO --> PDFTOPPM[pdftoppm<br/>Poppler utils]
-        FU --> FCCACHE[fc-cache<br/>Fontconfig]
-    end
-
-    subgraph "Infrastructure"
-        RUN[run.py] --> S
-        SYSTEMD[systemd service] --> RUN
-        APACHE[Apache / Nginx] --> OUTPUT[output/]
-    end
+    LO-->>Server: list of image paths
+    Server-->>Client: JSON response
 ```
-
-## Module Details
-
-### `font_utils.py`
-
-Handles all font-related operations for PPTX conversion:
-
-- **`extract_pptx_fonts()`** — Scans every `.rels` file in the PPTX archive (not just `presentation.xml.rels`) to build a complete map of font references. Extracts `.ttf`, `.otf`, `.odttf`, and `.fntdata` files. Deobfuscates OOXML-protected fonts using the relationship GUID per ECMA-376 §14.2.7.2.
-- **`get_used_font_names()`** — Parses DrawingML XML in all slides, masters, layouts, and themes to find every `typeface` reference.
-- **`check_missing_fonts()`** — Compares referenced fonts against `fc-list` output to warn about substitutions.
-
-### `lo_export.py`
-
-Manages the LibreOffice conversion pipeline:
-
-- Creates an isolated LibreOffice profile per conversion (avoids lock conflicts).
-- Configures font anti-aliasing, font substitution, and PDF font embedding via `registrymodifications.xcu`.
-- Converts PPTX → PDF using LibreOffice Impress with `EmbedCompleteFont` filter.
-- Renders PDF → PNG using `pdftoppm` with font and vector anti-aliasing.
-
-### `server.py`
-
-FastAPI HTTP service with two endpoints:
-
-- `GET /health` — Health check
-- `POST /convert` — Accepts multipart file upload, returns JSON with image paths
-
-### `docs2image.py`
-
-CLI tool with the same conversion logic. Useful for testing and batch processing.
 
 ## File Layout
 
@@ -99,7 +121,10 @@ docs2image/
 │   ├── server.py           # FastAPI HTTP service
 │   ├── docs2image.py       # CLI tool
 │   ├── font_utils.py       # Font extraction & management
-│   └── lo_export.py        # LibreOffice export pipeline
+│   ├── lo_export.py        # LibreOffice export pipeline
+│   └── pptx_preprocess.py  # Text overflow preprocessor
+├── static/
+│   └── index.html          # Web UI dashboard
 ├── docs/
 │   ├── architecture.md     # This file
 │   ├── fonts.md            # Font handling guide
@@ -108,42 +133,4 @@ docs2image/
 │   ├── n8n-integration.md  # n8n workflow setup
 │   └── docker-compose.yml  # Traefik/Nginx serving
 └── output/                 # Generated images (per session UUID)
-```
-
-## Data Flow (HTTP Request)
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Server as FastAPI
-    participant Fonts as font_utils
-    participant LO as lo_export
-    participant LibreOffice as soffice
-    participant Poppler as pdftoppm
-
-    Client->>Server: POST /convert (multipart file)
-    Server->>Server: Validate file type & size
-
-    alt PPTX file
-        Server->>Fonts: extract_pptx_fonts()
-        Fonts->>Fonts: Scan .rels, extract, deobfuscate
-        Fonts->>Fonts: Install to ~/.local/share/fonts
-        Fonts-->>Server: new font list
-
-        Server->>Fonts: check_missing_fonts()
-        Fonts-->>Server: missing font warnings
-
-        Server->>LO: convert_pptx_to_images()
-        LO->>LibreOffice: --convert-to pdf (with font embedding)
-        LibreOffice-->>LO: PDF file
-        LO->>Poppler: pdftoppm -png -r DPI
-        Poppler-->>LO: PNG files
-    else PDF file
-        Server->>LO: convert_pdf_to_images()
-        LO->>Poppler: pdftoppm -png -r DPI
-        Poppler-->>LO: PNG files
-    end
-
-    LO-->>Server: list of image paths
-    Server-->>Client: JSON response
 ```

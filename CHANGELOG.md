@@ -1,5 +1,43 @@
 # Changelog
 
+## v2.1.0 — 2026-03-17
+
+### Text Overflow Fix & Web UI
+
+Critical fix for PPTX text rendering where LibreOffice renders text ~13% wider than PowerPoint, causing titles to overflow their visual containers.
+
+#### Added
+- `pptx_preprocess.py` — Smart text overflow preprocessor using fontTools glyph metrics
+  - Measures actual text width with installed fonts
+  - Detects background rectangles to determine visual container width
+  - Shrinks only overflowing text and disables `normAutofit` to prevent LO override
+  - Estimates font size for shapes with inherited (no explicit) sizes
+- Web UI dashboard (`static/index.html`) with:
+  - Drag-drop file upload
+  - Thumbnail gallery grid per conversion session
+  - Full-screen lightbox viewer with keyboard navigation
+  - Live conversion log with elapsed timer
+  - Missing font warnings
+  - Service health indicator
+- `/sessions` API endpoint listing all conversion sessions
+- `/progress/{session_id}` SSE endpoint for real-time conversion progress
+- `missing_fonts` and `new_fonts` fields in `/convert` API response
+
+#### Changed
+- LibreOffice isolation switched from `HOME` override to `-env:UserInstallation` flag
+  - **Root cause fix**: `HOME=/tmp` broke fontconfig, making all user-installed fonts invisible to LibreOffice
+- LO_WIDTH_FACTOR calibrated to 1.15 (empirically measured)
+- `fonttools` added to requirements.txt
+- Font size estimation for shapes without explicit `sz`: uses 44pt for title-like text (uppercase, wide shapes)
+- `fc-list` output parsed with `errors="replace"` to handle non-UTF-8 font names
+
+#### Fixed
+- Titles overflowing dark banner backgrounds (e.g., "AMBASADORIŲ PROGRAMA - LT")
+- Text boxes with `normAutofit` ignoring preprocessor font size changes
+- Shapes with zero width (inherited from group/slide) now resolved via background rectangle detection
+
+---
+
 ## v2.0.0 — 2026-03-16
 
 ### Font Rendering Overhaul

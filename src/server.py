@@ -23,6 +23,7 @@ from fastapi.staticfiles import StaticFiles
 
 from font_utils import extract_pptx_fonts, check_missing_fonts
 from lo_export import convert_pptx_to_images, convert_pdf_to_images
+from pptx_preprocess import preprocess_pptx
 
 # Configure logging
 logging.basicConfig(
@@ -181,8 +182,17 @@ async def convert_document(file: UploadFile = File(...)):
                 else:
                     _emit(session_id, "fonts", "All fonts available ✓")
 
+                _emit(session_id, "preprocess", "Checking text layout…")
+                processed_path, mods = preprocess_pptx(input_path)
+                if mods > 0:
+                    _emit(session_id, "preprocess", f"Adjusted {mods} text boxes for compatibility")
+                    logger.info("Pre-processed: %d text boxes adjusted", mods)
+                    convert_source = processed_path
+                else:
+                    convert_source = input_path
+
                 _emit(session_id, "converting", "Converting PPTX → PDF via LibreOffice…")
-                image_paths = convert_pptx_to_images(input_path, session_dir, dpi=DPI)
+                image_paths = convert_pptx_to_images(convert_source, session_dir, dpi=DPI)
                 _emit(session_id, "rendering", f"Rendered {len(image_paths)} slides to PNG")
 
             else:
