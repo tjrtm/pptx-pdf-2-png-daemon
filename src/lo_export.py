@@ -61,47 +61,28 @@ def _configure_libreoffice_fonts(home_dir: str) -> None:
     logger.debug("Wrote LibreOffice config to %s", xcu_path)
 
 
-def _get_libreoffice_env(isolated: bool = True) -> dict[str, str]:
-    """Get environment variables for LibreOffice subprocess.
+def _get_libreoffice_env() -> tuple[dict[str, str], list[str]]:
+    """Get environment and extra CLI args for LibreOffice subprocess.
 
-    Uses an isolated LibreOffice user profile to avoid lock conflicts,
-    but preserves access to the real user's font directories via
-    fontconfig environment variables.
-
-    Args:
-        isolated: Use isolated /tmp profile to avoid conflicts with running LO instances
+    Uses LibreOffice's -env:UserInstallation flag to isolate the profile
+    WITHOUT overriding HOME. This keeps fontconfig working with the real
+    user font directories (~/.local/share/fonts/).
 
     Returns:
-        Environment dict for subprocess
+        Tuple of (environment dict, extra CLI arguments for soffice)
     """
     env = {**os.environ}
-    real_home = str(Path.home())
 
-    if isolated:
-        lo_home = tempfile.mkdtemp(prefix="docs2image_lo_")
-        env["HOME"] = lo_home
-        _configure_libreoffice_fonts(lo_home)
+    # Create isolated LO user profile via -env:UserInstallation
+    lo_profile = tempfile.mkdtemp(prefix="docs2image_lo_")
+    _configure_libreoffice_fonts(lo_profile)
 
-        # CRITICAL: Preserve font access from the real user home.
-        # Fontconfig looks in ~/.local/share/fonts/ and ~/.fonts/ by default,
-        # but with HOME overridden those paths point to the temp dir.
-        # Set XDG_DATA_HOME to the real location so fontconfig finds installed fonts.
-        real_data_home = os.path.join(real_home, ".local", "share")
-        if os.path.isdir(real_data_home):
-            env["XDG_DATA_HOME"] = real_data_home
+    # Use file:// URL for UserInstallation
+    profile_url = "file://" + lo_profile
 
-        # Also ensure FONTCONFIG_PATH includes the real font dirs
-        font_dirs = [
-            os.path.join(real_home, ".local", "share", "fonts"),
-            os.path.join(real_home, ".fonts"),
-        ]
-        existing = [d for d in font_dirs if os.path.isdir(d)]
-        if existing:
-            env["FONTCONFIG_PATH"] = env.get("FONTCONFIG_PATH", "/etc/fonts")
-    else:
-        _configure_libreoffice_fonts(real_home)
+    extra_args = [f"-env:UserInstallation={profile_url}"]
 
-    return env
+    return env, extra_args
 
 
 def convert_pptx_to_images(
@@ -153,10 +134,9 @@ def _pptx_to_pdf(pptx_path: Path) -> Path:
         raise RuntimeError(f"Input file is empty: {pptx_path}")
 
     temp_dir = tempfile.mkdtemp(prefix="docs2image_pdf_")
-    env = _get_libreoffice_env(isolated=True)
+    env, extra_args = _get_libreoffice_env()
 
     # Use Impress-specific PDF export with font embedding
-    # The filter string embeds all fonts and uses lossless image compression
     filter_options = (
         "pdf:impress_pdf_Export:"
         '{"EmbedStandardFonts":{"type":"boolean","value":"true"},'
@@ -169,6 +149,7 @@ def _pptx_to_pdf(pptx_path: Path) -> Path:
         "--headless",
         "--nofirststartwizard",
         "--norestore",
+        *extra_args,
         "--convert-to", filter_options,
         "--outdir", temp_dir,
         str(pptx_path),
@@ -194,6 +175,7 @@ def _pptx_to_pdf(pptx_path: Path) -> Path:
             "--headless",
             "--nofirststartwizard",
             "--norestore",
+            *extra_args,
             "--convert-to", "pdf",
             "--outdir", temp_dir,
             str(pptx_path),
