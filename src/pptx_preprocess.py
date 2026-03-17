@@ -20,14 +20,19 @@ from pathlib import Path
 logger = logging.getLogger("pptx_preprocess")
 
 # LibreOffice renders text wider than raw glyph metrics.
-# Measured empirically: ~13% wider, with 2% safety margin.
-LO_WIDTH_FACTOR = 1.15
+# Measured empirically: ~13% wider, with 5% safety margin.
+LO_WIDTH_FACTOR = 1.18
 
 # Don't shrink fonts smaller than this factor of original (max 18% reduction)
 MIN_SCALE = 0.82
 
 # Only process fonts this size or larger (points) — small text rarely overflows visibly
 MIN_FONT_SIZE_PT = 14
+
+# Default font size (hundredths of a point) when no explicit size is set.
+# OOXML spec says 18pt, but slide masters often override to 44pt for titles.
+# We use the slide master's txStyles title default if available.
+DEFAULT_FONT_SIZE_HUNDREDTHS = 1800  # 18pt fallback
 
 DRAWINGML_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 PRESENTML_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
@@ -93,6 +98,47 @@ def _measure_text_width(text: str, font_path: str, font_size_pt: float) -> float
         return None
 
 
+def _get_master_default_font_sizes(zf: zipfile.ZipFile) -> dict[str, int]:
+    """Get default font sizes from the slide master's txStyles.
+
+    Returns a dict with keys like 'title', 'body', 'other' mapped to
+    font size in hundredths of a point.
+    """
+    defaults = {
+        "title": 4400,  # 44pt — common PowerPoint default
+        "body": 1800,   # 18pt
+        "other": 1800,
+    }
+
+    master_files = [n for n in zf.namelist() if "slideMaster" in n and n.endswith(".xml")]
+    for mf in master_files:
+        try:
+            tree = ET.fromstring(zf.read(mf))
+        except ET.ParseError:
+            continue
+
+        # Look for <p:txStyles> which has titleStyle, bodyStyle, otherStyle
+        for ts in tree.iter(f"{{{PRESENTML_NS}}}txStyles"):
+            for style_elem in ts:
+                tag = style_elem.tag.split("}")[-1] if "}" in style_elem.tag else style_elem.tag
+                # Find the level 1 default
+                for lvl in style_elem:
+                    lvl_tag = lvl.tag.split("}")[-1] if "}" in lvl.tag else lvl.tag
+                    if "lvl1" in lvl_tag or lvl_tag == "defPPr":
+                        defRPr = lvl.find(f"{{{DRAWINGML_NS}}}defRPr")
+                        if defRPr is not None and defRPr.get("sz"):
+                            sz = int(defRPr.get("sz"))
+                            if "title" in tag.lower():
+                                defaults["title"] = sz
+                            elif "body" in tag.lower():
+                                defaults["body"] = sz
+                            elif "other" in tag.lower():
+                                defaults["other"] = sz
+        break  # Use first master
+
+    return defaults
+
+
 def _get_theme_fonts(zf: zipfile.ZipFile) -> tuple[str, str]:
     """Extract major (heading) and minor (body) font names from the theme."""
     heading_font = "Aptos Display"
@@ -129,27 +175,79 @@ def _resolve_font_name(typeface: str | None, heading_font: str, body_font: str) 
     return typeface
 
 
-def _process_slide_xml(xml_bytes: bytes, heading_font: str, body_font: str) -> tuple[bytes, int]:
+def _process_slide_xml(
+    xml_bytes: bytes,
+    heading_font: str,
+    body_font: str,
+    default_sizes: dict[str, int] | None = None,
+) -> tuple[bytes, int]:
     """Process a single slide XML, detecting and fixing text overflow.
 
     Returns (modified_xml_bytes, modification_count).
     """
     tree = ET.fromstring(xml_bytes)
     modifications = 0
+    if default_sizes is None:
+        default_sizes = {"title": 4400, "body": 1800, "other": 1800}
+
+    # Get slide dimensions for fallback (standard 16:9 = 12192000 x 6858000 EMU)
+    slide_width_emu = 12192000
+    slide_height_emu = 6858000
+
+    # Build a list of filled rectangle shapes (potential background containers)
+    # so we can match zero-width text shapes to their visual containers
+    bg_rects: list[tuple[int, int, int, int]] = []  # (x, y, width, height)
+    for bg_sp in tree.iter(f"{{{PRESENTML_NS}}}sp"):
+        bg_spPr = bg_sp.find(f"{{{PRESENTML_NS}}}spPr")
+        if bg_spPr is None:
+            continue
+        # Must have a fill (solid or gradient)
+        has_fill = (
+            bg_spPr.find(f"{{{DRAWINGML_NS}}}solidFill") is not None
+            or bg_spPr.find(f"{{{DRAWINGML_NS}}}gradFill") is not None
+        )
+        if not has_fill:
+            continue
+        bg_xfrm = bg_spPr.find(f"{{{DRAWINGML_NS}}}xfrm")
+        if bg_xfrm is None:
+            continue
+        bg_ext = bg_xfrm.find(f"{{{DRAWINGML_NS}}}ext")
+        bg_off = bg_xfrm.find(f"{{{DRAWINGML_NS}}}off")
+        if bg_ext is None:
+            continue
+        bg_cx = int(bg_ext.get("cx", "0"))
+        bg_cy = int(bg_ext.get("cy", "0"))
+        bg_x = int(bg_off.get("x", "0")) if bg_off is not None else 0
+        bg_y = int(bg_off.get("y", "0")) if bg_off is not None else 0
+        if bg_cx > 0:
+            bg_rects.append((bg_x, bg_y, bg_cx, bg_cy))
 
     for sp in tree.iter(f"{{{PRESENTML_NS}}}sp"):
         # Get shape dimensions - xfrm is in drawingml ns, may be under p:spPr or a:spPr
         xfrm = sp.find(f".//{{{DRAWINGML_NS}}}xfrm")
-        if xfrm is None:
-            continue
-        ext = xfrm.find(f"{{{DRAWINGML_NS}}}ext")
-        if ext is None:
-            continue
+        ext = xfrm.find(f"{{{DRAWINGML_NS}}}ext") if xfrm is not None else None
 
-        shape_width_emu = int(ext.get("cx", "0"))
-        shape_height_emu = int(ext.get("cy", "0"))
+        shape_width_emu = int(ext.get("cx", "0")) if ext is not None else 0
+        shape_height_emu = int(ext.get("cy", "0")) if ext is not None else 0
+
+        # Fall back for shapes with no explicit dimensions
         if shape_width_emu == 0:
-            continue
+            # Try to find a filled background rectangle to use as container
+            if bg_rects:
+                best_bg = max(bg_rects, key=lambda r: r[2])
+                shape_width_emu = best_bg[2]
+                if shape_height_emu == 0:
+                    shape_height_emu = best_bg[3]
+            else:
+                shape_width_emu = slide_width_emu
+        elif bg_rects:
+            # Even if the shape has dimensions, constrain to the background
+            # rectangle if it's smaller (text visually overflows the banner)
+            best_bg = max(bg_rects, key=lambda r: r[2])
+            if best_bg[2] < shape_width_emu:
+                shape_width_emu = best_bg[2]
+        if shape_height_emu == 0:
+            shape_height_emu = slide_height_emu
 
         # txBody can be in either namespace (p:txBody or a:txBody)
         txBody = sp.find(f"{{{PRESENTML_NS}}}txBody")
@@ -227,7 +325,30 @@ def _process_slide_xml(xml_bytes: bytes, heading_font: str, body_font: str) -> t
                             )
 
             full_text = full_text.strip()
-            if not full_text or font_size_pt is None or font_size_pt < MIN_FONT_SIZE_PT:
+            if not full_text:
+                continue
+
+            # If no explicit font size found, use master defaults
+            if font_size_pt is None:
+                # Guess whether this is title-like text based on characteristics:
+                # - All uppercase
+                # - Short text (< 80 chars)
+                # - Large shape
+                is_title_like = (
+                    full_text.isupper()
+                    or len(full_text) < 60
+                    or usable_width_pt > 500
+                )
+                default_key = "title" if is_title_like else "body"
+                font_size_pt = default_sizes.get(default_key, 1800) / 100
+                logger.debug(
+                    "Using default font size %.0fpt for '%s' (key=%s)",
+                    font_size_pt,
+                    full_text[:40],
+                    default_key,
+                )
+
+            if font_size_pt < MIN_FONT_SIZE_PT:
                 continue
 
             if font_name is None:
@@ -354,9 +475,16 @@ def preprocess_pptx(input_path: Path, output_path: Path | None = None) -> tuple[
         output_path = Path(temp_dir) / input_path.name
 
     with zipfile.ZipFile(input_path, "r") as zin:
-        # Get theme fonts
+        # Get theme fonts and master default sizes
         heading_font, body_font = _get_theme_fonts(zin)
-        logger.info("Theme fonts: heading=%s, body=%s", heading_font, body_font)
+        default_sizes = _get_master_default_font_sizes(zin)
+        logger.info(
+            "Theme fonts: heading=%s, body=%s; defaults: title=%.0fpt, body=%.0fpt",
+            heading_font,
+            body_font,
+            default_sizes.get("title", 4400) / 100,
+            default_sizes.get("body", 1800) / 100,
+        )
 
         total_modifications = 0
 
@@ -364,15 +492,15 @@ def preprocess_pptx(input_path: Path, output_path: Path | None = None) -> tuple[
             for item in zin.infolist():
                 data = zin.read(item.filename)
 
-                # Process slide XML files
+                # Process only actual slide XML files (not layouts, masters, or rels)
                 if (
                     item.filename.endswith(".xml")
-                    and "slide" in item.filename
+                    and item.filename.startswith("ppt/slides/slide")
                     and "/_rels/" not in item.filename
                 ):
                     try:
                         modified_data, mods = _process_slide_xml(
-                            data, heading_font, body_font
+                            data, heading_font, body_font, default_sizes
                         )
                         if mods > 0:
                             data = modified_data

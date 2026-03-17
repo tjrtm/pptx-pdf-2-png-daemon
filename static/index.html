@@ -494,7 +494,11 @@ async function handleFile(file) {
     }
 
     showResult(data, file.name);
-    showToast(data.count + ' slide' + (data.count !== 1 ? 's' : '') + ' converted', 'success');
+    var msg = data.count + ' slide' + (data.count !== 1 ? 's' : '') + ' converted';
+    if (data.missing_fonts && data.missing_fonts.length > 0) {
+      msg += ' (⚠️ ' + data.missing_fonts.length + ' fonts missing)';
+    }
+    showToast(msg, 'success');
     loadHistory();
   } catch (err) {
     if (err.name === 'AbortError') {
