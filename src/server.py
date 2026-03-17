@@ -4,16 +4,21 @@ docs2image HTTP service - Convert PDF or PPTX files to PNG images.
 
 Accepts multipart form-data file uploads.
 Serves a web UI for testing and browsing converted images.
+Provides real-time conversion progress via SSE.
 """
 
+import asyncio
 import logging
 import os
+import queue
 import tempfile
+import threading
+import time
 import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
+from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from font_utils import extract_pptx_fonts, check_missing_fonts
@@ -37,6 +42,10 @@ HOST = os.environ.get("DOCS2IMAGE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("DOCS2IMAGE_PORT", "8085"))
 DPI = int(os.environ.get("DOCS2IMAGE_DPI", "200"))
 
+# Progress tracking for active conversions
+# session_id -> queue of log messages
+_progress: dict[str, queue.Queue] = {}
+
 # Mount output directory for serving images
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/output", StaticFiles(directory=str(OUTPUT_DIR)), name="output")
@@ -44,6 +53,13 @@ app.mount("/output", StaticFiles(directory=str(OUTPUT_DIR)), name="output")
 # Mount static assets
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+def _emit(session_id: str, step: str, detail: str = ""):
+    """Send a progress event to the UI."""
+    q = _progress.get(session_id)
+    if q:
+        q.put({"step": step, "detail": detail, "ts": time.time()})
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -80,16 +96,33 @@ def list_sessions():
     return {"sessions": sessions}
 
 
+@app.get("/progress/{session_id}")
+async def progress_stream(session_id: str):
+    """SSE endpoint for real-time conversion progress."""
+    q = _progress.get(session_id)
+    if not q:
+        return JSONResponse(status_code=404, content={"error": "Session not found"})
+
+    async def event_generator():
+        import json
+        while True:
+            try:
+                msg = q.get_nowait()
+                yield f"data: {json.dumps(msg)}\n\n"
+                if msg.get("step") in ("done", "error"):
+                    break
+            except queue.Empty:
+                # Send keepalive
+                yield ": keepalive\n\n"
+                await asyncio.sleep(0.5)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
 @app.post("/convert")
 async def convert_document(file: UploadFile = File(...)):
-    """
-    Convert PDF or PPTX file to PNG images.
-
-    Accepts multipart form-data with a 'file' field.
-    Returns JSON with list of image paths.
-    """
+    """Convert PDF or PPTX file to PNG images."""
     try:
-        # Validate file extension
         filename = file.filename or "upload"
         ext = Path(filename).suffix.lower()
 
@@ -102,8 +135,8 @@ async def convert_document(file: UploadFile = File(...)):
                 },
             )
 
-        # Read file content
         file_data = await file.read()
+        file_size_mb = len(file_data) / (1024 * 1024)
 
         if len(file_data) < 100:
             return JSONResponse(
@@ -114,69 +147,80 @@ async def convert_document(file: UploadFile = File(...)):
                 },
             )
 
-        # Create session directory
         session_id = str(uuid.uuid4())
         session_dir = OUTPUT_DIR / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save uploaded file to temp location
+        # Set up progress tracking
+        _progress[session_id] = queue.Queue()
+
         temp_dir = tempfile.mkdtemp()
         safe_filename = "input" + ext
         input_path = Path(temp_dir) / safe_filename
         input_path.write_bytes(file_data)
 
+        _emit(session_id, "upload", f"Received {filename} ({file_size_mb:.1f} MB)")
+
         try:
+            missing = []
+            new_fonts_list = []
+
             if ext == ".pptx":
-                # Extract and install all embedded fonts
+                _emit(session_id, "fonts", "Extracting embedded fonts…")
                 new_fonts = extract_pptx_fonts(input_path)
                 if new_fonts:
-                    logger.info(
-                        "Installed %d embedded fonts: %s",
-                        len(new_fonts),
-                        ", ".join(new_fonts),
-                    )
+                    new_fonts_list = new_fonts
+                    _emit(session_id, "fonts", f"Installed {len(new_fonts)} embedded fonts")
+                    logger.info("Installed %d embedded fonts: %s", len(new_fonts), ", ".join(new_fonts))
 
-                # Check for missing fonts (informational)
+                _emit(session_id, "fonts", "Checking font availability…")
                 missing = check_missing_fonts(input_path)
                 if missing:
-                    logger.warning(
-                        "Missing fonts (will be substituted): %s",
-                        ", ".join(missing),
-                    )
+                    _emit(session_id, "fonts_warning", f"{len(missing)} fonts not found: {', '.join(missing[:5])}{'…' if len(missing) > 5 else ''}")
+                    logger.warning("Missing fonts: %s", ", ".join(missing))
+                else:
+                    _emit(session_id, "fonts", "All fonts available ✓")
 
-                # Convert PPTX directly to images
-                image_paths = convert_pptx_to_images(
-                    input_path, session_dir, dpi=DPI
-                )
+                _emit(session_id, "converting", "Converting PPTX → PDF via LibreOffice…")
+                image_paths = convert_pptx_to_images(input_path, session_dir, dpi=DPI)
+                _emit(session_id, "rendering", f"Rendered {len(image_paths)} slides to PNG")
+
             else:
-                # PDF: render directly to images
-                image_paths = convert_pdf_to_images(
-                    input_path, session_dir, dpi=DPI
-                )
-                missing = []
+                _emit(session_id, "converting", "Rendering PDF pages to PNG…")
+                image_paths = convert_pdf_to_images(input_path, session_dir, dpi=DPI)
+                _emit(session_id, "rendering", f"Rendered {len(image_paths)} pages to PNG")
 
-            return {
+            result = {
                 "success": True,
                 "session_id": session_id,
                 "filename": filename,
-                "images": [
-                    f"/output/{session_id}/{p.name}" for p in image_paths
-                ],
+                "images": [f"/output/{session_id}/{p.name}" for p in image_paths],
                 "count": len(image_paths),
-                "missing_fonts": missing if missing else [],
+                "missing_fonts": missing,
+                "new_fonts": new_fonts_list,
             }
 
+            _emit(session_id, "done", f"Complete: {len(image_paths)} images")
+            return result
+
         finally:
-            # Cleanup temp files
             if input_path.exists():
                 input_path.unlink()
             try:
                 Path(temp_dir).rmdir()
             except OSError:
                 pass
+            # Clean up progress queue after a delay
+            def _cleanup():
+                import time
+                time.sleep(30)
+                _progress.pop(session_id, None)
+            threading.Thread(target=_cleanup, daemon=True).start()
 
     except Exception as e:
         logger.exception("Conversion failed")
+        if session_id in _progress:
+            _emit(session_id, "error", str(e))
         return JSONResponse(
             status_code=500, content={"success": False, "error": str(e)}
         )
