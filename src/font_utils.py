@@ -285,6 +285,7 @@ def get_system_font_families() -> set[str]:
         ["fc-list", "--format", "%{family}\n"],
         capture_output=True,
         text=True,
+        errors="replace",
     )
     families: set[str] = set()
     for line in result.stdout.splitlines():
