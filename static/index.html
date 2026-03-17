@@ -68,9 +68,7 @@
   }
 
   /* Upload area */
-  .upload-section {
-    margin-bottom: 2rem;
-  }
+  .upload-section { margin-bottom: 2rem; }
 
   .drop-zone {
     border: 2px dashed var(--border);
@@ -93,28 +91,11 @@
     pointer-events: none;
   }
 
-  .drop-icon {
-    font-size: 2.5rem;
-    margin-bottom: 0.75rem;
-  }
+  .drop-icon { font-size: 2.5rem; margin-bottom: 0.75rem; }
+  .drop-text { font-size: 1rem; color: var(--text-dim); margin-bottom: 0.25rem; }
+  .drop-hint { font-size: 0.8rem; color: var(--text-dim); opacity: 0.6; }
 
-  .drop-text {
-    font-size: 1rem;
-    color: var(--text-dim);
-    margin-bottom: 0.25rem;
-  }
-
-  .drop-hint {
-    font-size: 0.8rem;
-    color: var(--text-dim);
-    opacity: 0.6;
-  }
-
-  .progress-bar {
-    display: none;
-    margin-top: 1.5rem;
-  }
-
+  .progress-bar { display: none; margin-top: 1.5rem; }
   .progress-bar.active { display: block; }
 
   .progress-track {
@@ -128,7 +109,6 @@
     height: 100%;
     background: var(--accent);
     border-radius: 2px;
-    transition: width 0.3s;
     animation: indeterminate 1.5s ease-in-out infinite;
   }
 
@@ -206,15 +186,8 @@
     gap: 0.75rem;
   }
 
-  .session-filename {
-    font-weight: 500;
-    font-size: 0.9rem;
-  }
-
-  .session-meta {
-    font-size: 0.75rem;
-    color: var(--text-dim);
-  }
+  .session-filename { font-weight: 500; font-size: 0.9rem; }
+  .session-meta { font-size: 0.75rem; color: var(--text-dim); }
 
   .slide-count {
     font-size: 0.75rem;
@@ -334,7 +307,6 @@
     text-align: center;
   }
 
-  /* History section */
   .history-section { margin-top: 2rem; }
 
   .empty-state {
@@ -345,7 +317,7 @@
 
   .empty-state .icon { font-size: 2rem; margin-bottom: 0.5rem; }
 
-  /* Error toast */
+  /* Toast */
   .toast {
     position: fixed;
     bottom: 2rem;
@@ -444,11 +416,12 @@ const clearHistoryBtn = document.getElementById('clearHistoryBtn');
 
 let lightboxImages = [];
 let lightboxIndex = 0;
+let isConverting = false;
 
 // Health check
 async function checkHealth() {
   try {
-    const res = await fetch('/health');
+    const res = await fetch('/health', { signal: AbortSignal.timeout(5000) });
     const data = await res.json();
     if (data.status === 'ok') {
       statusBadge.textContent = '● online';
@@ -463,19 +436,19 @@ async function checkHealth() {
 }
 
 // Drop zone events
-dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('click', () => { if (!isConverting) fileInput.click(); });
 dropZone.addEventListener('dragover', e => {
   e.preventDefault();
-  dropZone.classList.add('dragover');
+  if (!isConverting) dropZone.classList.add('dragover');
 });
 dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
 dropZone.addEventListener('drop', e => {
   e.preventDefault();
   dropZone.classList.remove('dragover');
-  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+  if (!isConverting && e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
 });
 fileInput.addEventListener('change', () => {
-  if (fileInput.files.length) handleFile(fileInput.files[0]);
+  if (!isConverting && fileInput.files.length) handleFile(fileInput.files[0]);
 });
 
 // Upload and convert
@@ -486,27 +459,52 @@ async function handleFile(file) {
     return;
   }
 
+  isConverting = true;
   dropZone.classList.add('converting');
   progressBar.classList.add('active');
-  progressText.textContent = `Converting ${file.name}…`;
+  progressText.textContent = 'Converting ' + file.name + '… (this may take a minute for large files)';
 
   const formData = new FormData();
   formData.append('file', file);
 
+  // Use AbortController with a generous timeout (5 min for large PPTX)
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 300000);
+
   try {
-    const res = await fetch('/convert', { method: 'POST', body: formData });
-    const data = await res.json();
+    const res = await fetch('/convert', {
+      method: 'POST',
+      body: formData,
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    // Read the full response text first, then parse
+    const text = await res.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (parseErr) {
+      throw new Error('Invalid server response: ' + text.substring(0, 200));
+    }
 
     if (!data.success) {
       throw new Error(data.error || 'Conversion failed');
     }
 
     showResult(data, file.name);
-    showToast(`${data.count} slide${data.count !== 1 ? 's' : ''} converted`, 'success');
+    showToast(data.count + ' slide' + (data.count !== 1 ? 's' : '') + ' converted', 'success');
     loadHistory();
   } catch (err) {
-    showToast(err.message, 'error');
+    if (err.name === 'AbortError') {
+      showToast('Conversion timed out. The file may be too large.', 'error');
+    } else {
+      showToast(err.message, 'error');
+    }
   } finally {
+    clearTimeout(timeoutId);
+    isConverting = false;
     dropZone.classList.remove('converting');
     progressBar.classList.remove('active');
     fileInput.value = '';
@@ -522,48 +520,52 @@ function showResult(data, filename) {
 // Build a session card
 function buildSessionCard(sessionId, images, filename, expanded) {
   const shortId = sessionId.substring(0, 8);
-  const thumbs = images.map((src, i) => `
-    <div class="thumb-wrapper" onclick="openLightbox(${JSON.stringify(images)}, ${i})">
-      <img src="${src}" alt="Page ${i + 1}" loading="lazy">
-      <div class="thumb-label">Page ${i + 1}</div>
-    </div>
-  `).join('');
+  const imagesJson = JSON.stringify(images).replace(/'/g, "\\'").replace(/"/g, '&quot;');
+  const thumbs = images.map(function(src, i) {
+    return '<div class="thumb-wrapper" onclick="openLightbox(' + imagesJson + ', ' + i + ')">' +
+      '<img src="' + src + '" alt="Page ' + (i + 1) + '" loading="lazy">' +
+      '<div class="thumb-label">Page ' + (i + 1) + '</div>' +
+      '</div>';
+  }).join('');
 
-  return `
-    <div class="session-card">
-      <div class="session-header" onclick="this.nextElementSibling.classList.toggle('collapsed')">
-        <div class="session-info">
-          <span class="session-filename">${filename || shortId}</span>
-          <span class="session-meta">${shortId}</span>
-        </div>
-        <span class="slide-count">${images.length} slide${images.length !== 1 ? 's' : ''}</span>
-      </div>
-      <div class="gallery ${expanded ? '' : 'collapsed'}">
-        ${thumbs}
-      </div>
-    </div>
-  `;
+  return '<div class="session-card">' +
+    '<div class="session-header" onclick="this.nextElementSibling.classList.toggle(\'collapsed\')">' +
+      '<div class="session-info">' +
+        '<span class="session-filename">' + (filename || shortId) + '</span>' +
+        '<span class="session-meta">' + shortId + '</span>' +
+      '</div>' +
+      '<span class="slide-count">' + images.length + ' slide' + (images.length !== 1 ? 's' : '') + '</span>' +
+    '</div>' +
+    '<div class="gallery ' + (expanded ? '' : 'collapsed') + '">' +
+      thumbs +
+    '</div>' +
+  '</div>';
 }
 
 // Load history from server
 async function loadHistory() {
   try {
-    const res = await fetch('/sessions');
-    const data = await res.json();
+    const res = await fetch('/sessions', { signal: AbortSignal.timeout(10000) });
+    const text = await res.text();
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      return;
+    }
 
     if (data.sessions && data.sessions.length > 0) {
       clearHistoryBtn.classList.remove('hidden');
       historyContainer.innerHTML = data.sessions
-        .map(s => buildSessionCard(s.session_id, s.images, null, false))
+        .map(function(s) { return buildSessionCard(s.session_id, s.images, null, false); })
         .join('');
     } else {
       clearHistoryBtn.classList.add('hidden');
-      historyContainer.innerHTML = `
-        <div class="empty-state">
-          <div class="icon">📂</div>
-          <div>No conversions yet</div>
-        </div>
-      `;
+      historyContainer.innerHTML =
+        '<div class="empty-state">' +
+          '<div class="icon">📂</div>' +
+          '<div>No conversions yet</div>' +
+        '</div>';
     }
   } catch {
     // Ignore history load errors
@@ -571,19 +573,17 @@ async function loadHistory() {
 }
 
 function clearHistory() {
-  // Just clear the UI, doesn't delete files
-  historyContainer.innerHTML = `
-    <div class="empty-state">
-      <div class="icon">📂</div>
-      <div>No conversions yet</div>
-    </div>
-  `;
+  historyContainer.innerHTML =
+    '<div class="empty-state">' +
+      '<div class="icon">📂</div>' +
+      '<div>No conversions yet</div>' +
+    '</div>';
   clearHistoryBtn.classList.add('hidden');
 }
 
 // Lightbox
 function openLightbox(images, index) {
-  lightboxImages = images;
+  lightboxImages = typeof images === 'string' ? JSON.parse(images) : images;
   lightboxIndex = index;
   updateLightbox();
   document.getElementById('lightbox').classList.add('open');
@@ -601,14 +601,13 @@ function navigateLightbox(dir) {
 }
 
 function updateLightbox() {
-  const img = document.getElementById('lightboxImg');
-  const caption = document.getElementById('lightboxCaption');
-  img.src = lightboxImages[lightboxIndex];
-  caption.textContent = `Page ${lightboxIndex + 1} of ${lightboxImages.length}`;
+  document.getElementById('lightboxImg').src = lightboxImages[lightboxIndex];
+  document.getElementById('lightboxCaption').textContent =
+    'Page ' + (lightboxIndex + 1) + ' of ' + lightboxImages.length;
 }
 
 // Keyboard navigation
-document.addEventListener('keydown', e => {
+document.addEventListener('keydown', function(e) {
   if (!document.getElementById('lightbox').classList.contains('open')) return;
   if (e.key === 'Escape') closeLightbox();
   if (e.key === 'ArrowLeft') navigateLightbox(-1);
@@ -617,10 +616,10 @@ document.addEventListener('keydown', e => {
 
 // Toast
 function showToast(message, type) {
-  const toast = document.getElementById('toast');
+  var toast = document.getElementById('toast');
   toast.textContent = message;
-  toast.className = `toast ${type} show`;
-  setTimeout(() => toast.classList.remove('show'), 3000);
+  toast.className = 'toast ' + type + ' show';
+  setTimeout(function() { toast.classList.remove('show'); }, 4000);
 }
 
 // Init
